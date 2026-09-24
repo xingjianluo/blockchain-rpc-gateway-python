@@ -1,0 +1,21 @@
+{
+  "use_fake_upstreams": true,
+  "host": "127.0.0.1",
+  "port": 8000,
+  "timeout": 2.0,
+  "cooldown": 1.0,
+  "cache_ttl": 300.0,
+  "max_batch": 100,
+  "nodes": [
+    {"name": "node-a", "url": "http://127.0.0.1:9101", "weight": 1.0},
+    {"name": "node-b", "url": "http://127.0.0.1:9102", "weight": 1.0},
+    {"name": "node-c", "url": "http://127.0.0.1:9103", "weight": 1.0}
+  ],
+  "forbidden_methods": [
+    "eth_sendRawTransaction",
+    "eth_sendTransaction",
+    "miner_start",
+    "miner_stop",
+    "admin_nodeInfo"
+  ]
+}
