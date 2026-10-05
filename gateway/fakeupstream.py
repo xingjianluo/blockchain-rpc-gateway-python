@@ -92,6 +92,13 @@ def _handle_method(chain: FakeChain, method: str, params: Any) -> Any:
         if height is None:
             return None
         return hex(chain.balance_at(height, params[0]))
+    if method == "eth_getTransactionReceipt":
+        if not isinstance(params, list) or not params or not isinstance(
+            params[0], str
+        ):
+            raise ValueError("expected [txHash]")
+        # 交易尚未上链时按以太坊惯例返回 null（非业务错误）。
+        return chain.receipt(params[0])
     # 未知方法：标准业务错误，网关不得重试。
     return _MethodNotFound(method)
 

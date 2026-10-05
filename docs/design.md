@@ -14,7 +14,8 @@ gateway/
 ├── selector.py     # 健康度/延迟节点选择
 ├── policy.py       # 方法白/黑名单 + 批量大小约束
 ├── cache.py        # 最终性缓存 FinalityCache + SingleFlight
-├── dispatcher.py   # 分发：缓存 -> 选节点 -> 传输重试 / 业务短路
+├── waiter.py       # 等待交易确认 WaitCoordinator：预算轮询/同交易合并/重组感知
+├── dispatcher.py   # 分发：缓存 -> 选节点 -> 传输重试 / 业务短路 / 等待确认
 └── app.py          # FastAPI 协议入口（单条/批量/通知/管理端点）
 main.py             # 启动 3 个假节点 + 网关的本地示例
 ```
@@ -127,11 +128,117 @@ node=node-a 返回业务错误 code=-32601 (method x not found)，确定性结�
 策略拒绝、畸形项）都不会拖垮或截断整批，调用方原始 `id`（数字/字符串/null/重复）
 原样回显，不错位、不互相污染。
 
-## 5. 假节点故障模型（`fakeupstream`）
+## 5. 等待交易确认（`gw_waitForTransaction`，`waiter.py`）
+
+### 5.1 请求与确认条件
+
+网关在标准 JSON-RPC 上新增一个方法 `gw_waitForTransaction`，用于“在预算内
+等某笔交易达到指定确认深度、或等到已最终确定”。支持具名与位置两种参数：
+
+```jsonc
+// 具名
+{"transactionHash": "0x..", "confirmations": 3,
+ "timeoutMs": 8000, "pollIntervalMs": 100}
+// 等到最终确定（与 confirmations 二选一，finalized 优先）
+{"transactionHash": "0x..", "finalized": true, "timeoutMs": 12000}
+// 位置：[txHash] / [txHash, confirmations] / [txHash, confirmations, timeoutMs]
+```
+
+| 参数 | 含义 | 缺省/约束 |
+|---|---|---|
+| `transactionHash` | 交易标识 | 必填，`0x` 前缀字符串，否则 `-32602` |
+| `confirmations` | 期望确认深度 | 缺省 1；正整数（十进制或 `0x`） |
+| `finalized` | 是否等到所在区块最终确定 | `true` 时忽略确认深度 |
+| `timeoutMs` | 总等待预算 | 缺省 10000；正整数 |
+| `pollIntervalMs` | 轮询间隔 | 缺省 100；会被网关下限收敛 |
+
+确认数按惯例定义：`confirmations = head - tx_block + 1`。
+`finalized` 条件要求 `tx_block <= finalized_number`。
+
+### 5.2 轮询、预算与结论
+
+等待循环在预算内周期性地通过**既有分发链**（`dispatch_poll`：最终性缓存 →
+节点选择 → 传输重试）依次发起三个标准只读调用：
+
+1. `eth_blockNumber`：当前链顶高度；
+2. `eth_getBlockByNumber(["finalized", false])`：当前最终高度，首次回填
+   最终性缓存后，后续每轮稳定**命中缓存**；
+3. `eth_getTransactionReceipt([txHash])`：交易落地位置（未上链按惯例为 `null`）。
+
+每轮拿到链上事实后，**逐个等待方按自己的条件与预算独立结算**：
+
+- 条件满足 → 返回 `confirmed`（结构见 5.5）；
+- 预算已到而条件未满足 → 返回 `-32020 WAIT_TIMEOUT`，`data` 明确标注当前
+  链顶/最终高度、交易是否已上链、已用时间与轮询次数；
+- 既不会无限挂起，也不会在确认深度不足 / 未最终确定时提前伪造成功结果。
+
+内部轮询拿到上游的**业务错误**（如收据方法 `-32602`）是确定性结论：
+原样透传给所有等待方并结束该交易的等待；**传输故障**（连接重置/超时/
+非法响应）只记录降级原因、切换节点重试，不改变等待结论。若链顶查询持续
+传输失败，到达预算的等待方仍会被结算为超时，不会被挂住。
+
+### 5.3 同一交易的等待合并（single-flight 等待）
+
+`WaitCoordinator` 按 `tx_hash` 为每笔交易维护唯一一个 `_TxWatcher`：
+
+- 同一时刻任意多个调用方（含同一批次的多个项）等待同一笔交易，
+  只产生**一份**链顶/最终高度/收据轮询流量，不重复打上游；
+- 共享的是“链上事实”，**结论不共享**：每个等待方用自己的条件、预算、
+  原始 `id` 独立构造响应；成功、超时、不同条件互不串味；
+- 不同交易各有独立 watcher，互不影响；
+- 最后一个等待方结束/离开后摘除 watcher 并取消轮询；客户端中途断开
+  只移除自己，不影响其余等待方。
+
+### 5.4 重组期间的表现（关键）
+
+watcher 记住上一轮交易所在 `(block_number, block_hash)`：
+
+- **曾上链 → 本轮收据变 `null`**：判定被重组回滚，置 `reorged_seen`，
+  绝不再把回滚前的位置当作已确认/已最终结果返回；
+- 在**剩余预算内继续观察**：
+  - 交易在新区块重新上链（`blockHash` 变化）→ 按**新位置**重新计确认数，
+    达标后返回 `confirmed` 且 `reorged: true`（与一路正常确认可区分）；
+  - 预算耗尽时交易仍未回到链上 → 返回 **`-32021 TX_REORGED`**，
+    与“正常确认”“普通超时”都明确可区分，`data.reorged=true`，
+    并给出最后一次见到的区块高度与原因。
+
+假链为此提供：`send_tx`（入交易池）、`mine`（把池中交易确定性打进
+第一个新区块）、`reorg(depth, dropped_txs=..., extra=...)`
+（回滚未最终区块、以新 epoch 重出；交易默认退回池中等待重新打包，
+`dropped_txs` 内的交易彻底丢弃），详见 `fakechain.py`。
+
+### 5.5 成功结果结构
+
+```jsonc
+{
+  "status": "confirmed",
+  "transactionHash": "0x..",
+  "blockNumber": "0x..", "blockHash": "0x..",
+  "confirmations": "0x..",         // 当前确认深度
+  "finalized": true,               // 所在区块当前是否已最终确定
+  "reorged": false,                // 等待期间是否经历过重组
+  "condition": "confirmations>=3", // 或 "finalized"
+  "waitedMs": 142, "polls": 3,
+  "node": "node-b"                 // 收据结论最终落在哪个上游
+}
+```
+
+### 5.6 与现有能力的兼容范围
+
+- **方法策略**：`gw_waitForTransaction` 本身先走方法级访问限制（黑名单/
+  白名单），被限制时网关直接 `-32001`、不发起任何轮询；内部三个只读方法
+  使用固定标准方法，经 `dispatch_poll` 走缓存与重试，不重复过策略；
+- **上游选择 / 故障降级重试**：每一轮的每个只读调用都经过节点打分排序与
+  传输故障切换，健康度、延迟统计正常累计；
+- **最终性缓存**：finalized 高度查询纳入既有 `FinalityCache`，随链推进
+  形成新键、随重组失效；
+- **批量协议**：等待方法可与普通只读项混在同一批次，各项并发独立分发、
+  按槽位对齐回写，单项超时/重组/错误不拖垮或串改其他项；
+- **新增错误码**：`-32020 WAIT_TIMEOUT`、`-32021 TX_REORGED`（见错误码速查）。
+
+## 6. 假节点故障模型（`fakeupstream`）
 
 每个节点以守护线程运行**真实 uvicorn + TCP 端口**，支持确定性注入：
-
-- `latency_ms` / `jitter_ms`（带种子的抖动）；
 - `fail_first=N`：前 N 次请求在 ASGI 层发出响应头后异常断连，
   客户端稳定得到 `httpx.RemoteProtocolError`（与业务错误完全可区分），之后恢复；
 - `always_connection_reset`：持续连接重置；

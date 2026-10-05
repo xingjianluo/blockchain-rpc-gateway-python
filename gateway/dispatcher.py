@@ -26,6 +26,7 @@ from gateway.models import (
 )
 from gateway.policy import MethodPolicy
 from gateway.selector import NodeSelector
+from gateway.waiter import WAIT_METHOD, WaitCoordinator, parse_wait_request
 
 logger = logging.getLogger("gateway.dispatcher")
 
@@ -46,6 +47,7 @@ class Dispatcher:
         self._selector = NodeSelector(nodes)
         self.cache = cache or FinalityCache(chain)
         self._single_flight = SingleFlight()
+        self.wait_coordinator = WaitCoordinator(dispatcher=self)
         # AsyncClient 绑定事件循环；TestClient 每次请求使用不同循环，
         # 因此按运行循环惰性创建并缓存，循环结束自动关闭。
         self._clients: dict[asyncio.AbstractEventLoop, httpx.AsyncClient] = {}
@@ -80,15 +82,57 @@ class Dispatcher:
                 node=None, retries=0, cache_hit=False, reasons=reasons,
             )
 
-        # 2) 最终性缓存 + single-flight（仅只读、已最终确定）。
+        # 2) 等待交易确认：策略校验之后、缓存/回源之前拦截，由协调器处理。
+        if req.method == WAIT_METHOD:
+            return await self._dispatch_wait(req)
+
+        # 3) 最终性缓存 + single-flight（仅只读、已最终确定）。
         key = cache_key(req, self._chain)
         if key is not None:
             return await self._single_flight.run(
                 key, lambda: self._dispatch_cached(req, key, reasons)
             )
 
-        # 3) 非缓存请求直接走节点重试链。
+        # 4) 非缓存请求直接走节点重试链。
         return await self._dispatch_with_retry(req, reasons)
+
+    async def dispatch_poll(self, req: RpcRequest) -> DispatchResult:
+        """等待循环内部轮询入口：经缓存/选节点/重试，但不再过方法策略。
+
+        轮询使用的三个标准只读方法天然不在拒绝名单；这样做同时避免内部
+        调用在白名单模式下被策略挡住。
+        """
+        poll_reasons: list[str] = []
+        key = cache_key(req, self._chain)
+        if key is not None:
+            return await self._single_flight.run(
+                key, lambda: self._dispatch_cached(req, key, poll_reasons)
+            )
+        return await self._dispatch_with_retry(req, poll_reasons)
+
+    async def _dispatch_wait(self, req: RpcRequest) -> DispatchResult:
+        params, err = parse_wait_request(req)
+        if err is not None:
+            reason = "等待参数非法，网关直接返回 -32602，不发起轮询"
+            logger.info("method=%s %s", WAIT_METHOD, reason)
+            return DispatchResult(
+                err, node=None, retries=0, cache_hit=False,
+                reasons=[reason],
+            )
+        assert params is not None
+        logger.info(
+            "method=%s tx=%s 条件=%s 预算=%sms",
+            WAIT_METHOD, params.tx_hash, params.condition_label(),
+            params.timeout_ms,
+        )
+        outcome = await self.wait_coordinator.wait(params, req_id=req.req_id)
+        return DispatchResult(
+            outcome.response,
+            node=outcome.node,
+            retries=0,
+            cache_hit=False,
+            reasons=outcome.reasons,
+        )
 
     async def _dispatch_cached(
         self, req: RpcRequest, key: str, reasons: list[str]

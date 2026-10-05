@@ -24,6 +24,10 @@ logging.basicConfig(
 
 _chain = FakeChain(seed=20260924, initial_blocks=12, finalized_offset=4)
 
+# 预置一笔已上链的演示交易（在高度 8），便于手动调用 gw_waitForTransaction。
+DEMO_TX = "0xabc0000000000000000000000000000000000000000000000000000000000001"
+_chain.blocks[8].transactions.append(DEMO_TX)
+
 _FAULTS = {
     "node-a": FaultConfig(latency_ms=8, jitter_ms=4, seed=11),
     "node-b": FaultConfig(fail_first=2, latency_ms=5, seed=22),
