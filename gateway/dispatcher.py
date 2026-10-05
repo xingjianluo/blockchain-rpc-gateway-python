@@ -26,6 +26,11 @@ from gateway.models import (
 )
 from gateway.policy import MethodPolicy
 from gateway.selector import NodeSelector
+from gateway.waiter import (
+    WAIT_FOR_TX_METHOD,
+    WaiterRegistry,
+    parse_wait_condition,
+)
 
 logger = logging.getLogger("gateway.dispatcher")
 
@@ -38,6 +43,7 @@ class Dispatcher:
         policy: MethodPolicy,
         timeout: float = 2.0,
         cache: FinalityCache | None = None,
+        wait_poll_interval: float = 1.0,
     ):
         self._nodes = nodes
         self._chain = chain
@@ -46,6 +52,7 @@ class Dispatcher:
         self._selector = NodeSelector(nodes)
         self.cache = cache or FinalityCache(chain)
         self._single_flight = SingleFlight()
+        self.waiters = WaiterRegistry(self, chain, wait_poll_interval)
         # AsyncClient 绑定事件循环；TestClient 每次请求使用不同循环，
         # 因此按运行循环惰性创建并缓存，循环结束自动关闭。
         self._clients: dict[asyncio.AbstractEventLoop, httpx.AsyncClient] = {}
@@ -80,14 +87,29 @@ class Dispatcher:
                 node=None, retries=0, cache_hit=False, reasons=reasons,
             )
 
-        # 2) 最终性缓存 + single-flight（仅只读、已最终确定）。
+        # 2) 等待交易确认：网关侧轮询编排，按 tx 合并、按等待方独立判定。
+        if req.method == WAIT_FOR_TX_METHOD:
+            try:
+                cond = parse_wait_condition(req)
+            except (ValueError, TypeError) as exc:
+                reason = f"gw_waitForTransaction 参数非法: {exc}"
+                logger.info("%s", reason)
+                return DispatchResult(
+                    RpcResponse.fail(req.req_id, RpcErrorCode.INVALID_PARAMS,
+                                     f"invalid params: {exc}",
+                                     data={"reason": reason}),
+                    node=None, retries=0, cache_hit=False, reasons=[reason],
+                )
+            return await self.waiters.wait(req, cond)
+
+        # 3) 最终性缓存 + single-flight（仅只读、已最终确定）。
         key = cache_key(req, self._chain)
         if key is not None:
             return await self._single_flight.run(
                 key, lambda: self._dispatch_cached(req, key, reasons)
             )
 
-        # 3) 非缓存请求直接走节点重试链。
+        # 4) 非缓存请求直接走节点重试链。
         return await self._dispatch_with_retry(req, reasons)
 
     async def _dispatch_cached(

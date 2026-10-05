@@ -58,9 +58,11 @@ def gateway_factory(nodes, chain, policy):
     created: list[Dispatcher] = []
 
     def _factory(node_list=None, pol: MethodPolicy | None = None,
-                 timeout: float = 2.0) -> tuple:
+                 timeout: float = 2.0,
+                 wait_poll_interval: float = 0.05) -> tuple:
         dispatcher = Dispatcher(
-            node_list or nodes, chain, pol or policy, timeout=timeout
+            node_list or nodes, chain, pol or policy, timeout=timeout,
+            wait_poll_interval=wait_poll_interval,
         )
         created.append(dispatcher)
         app = create_app(chain=chain, policy=pol or policy,

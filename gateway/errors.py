@@ -27,6 +27,8 @@ class RpcErrorCode:
     UPSTREAM_TIMEOUT = -32004        # 所有上游均超时
     BATCH_TOO_LARGE = -32010         # 批量请求条数超限
     BATCH_MALFORMED = -32011         # 批量请求结构畸形
+    WAIT_TIMEOUT = -32020            # 等待交易确认超出时间预算
+    TX_REORGED = -32021              # 等待期间交易被重组回滚且预算内未重新上链
 
 
 # 业务错误码集合：上游返回这些错误时绝不重试。

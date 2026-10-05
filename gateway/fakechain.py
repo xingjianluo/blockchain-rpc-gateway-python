@@ -29,6 +29,7 @@ class Block:
     parent_hash: str
     timestamp: int
     epoch: int = 0
+    txs: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -82,6 +83,47 @@ class FakeChain:
             self.blocks[number].block_hash, account.lower(),
         )
         return int(digest[2:18], 16)
+
+    # ---- 交易 ----
+    def include_tx(self, tx_hash: str, block_number: int | None = None) -> int:
+        """把交易直接打包进指定区块（默认链顶），返回所在高度。
+
+        同一笔交易只保留最新一次打包位置（重新上链时先摘除旧位置）。
+        """
+        number = self.head_number() if block_number is None else block_number
+        if not self._has(number):
+            raise ValueError(f"block {number} out of range")
+        self.drop_tx(tx_hash)
+        self.blocks[number].txs.append(tx_hash)
+        return number
+
+    def drop_tx(self, tx_hash: str) -> bool:
+        """把交易从所在区块摘除（回到未上链状态）。"""
+        for b in self.blocks:
+            if tx_hash in b.txs:
+                b.txs.remove(tx_hash)
+                return True
+        return False
+
+    def tx_location(self, tx_hash: str) -> tuple[int, str] | None:
+        """返回 (高度, 区块哈希)；未上链返回 None。"""
+        for b in self.blocks:
+            if tx_hash in b.txs:
+                return b.number, b.block_hash
+        return None
+
+    def tx_receipt(self, tx_hash: str) -> dict[str, Any] | None:
+        """构造 eth_getTransactionReceipt 风格的回执；未上链返回 None。"""
+        loc = self.tx_location(tx_hash)
+        if loc is None:
+            return None
+        number, block_hash = loc
+        return {
+            "transactionHash": tx_hash,
+            "blockNumber": hex(number),
+            "blockHash": block_hash,
+            "status": "0x1",
+        }
 
     # ---- 状态推进 ----
     def _make_block(self, number: int) -> Block:

@@ -14,7 +14,8 @@ gateway/
 ├── selector.py     # 健康度/延迟节点选择
 ├── policy.py       # 方法白/黑名单 + 批量大小约束
 ├── cache.py        # 最终性缓存 FinalityCache + SingleFlight
-├── dispatcher.py   # 分发：缓存 -> 选节点 -> 传输重试 / 业务短路
+├── waiter.py       # 等待交易确认：按 tx 合并轮询、按等待方独立判定
+├── dispatcher.py   # 分发：缓存 -> 选节点 -> 传输重试 / 业务短路 / 等待编排
 └── app.py          # FastAPI 协议入口（单条/批量/通知/管理端点）
 main.py             # 启动 3 个假节点 + 网关的本地示例
 ```
@@ -127,7 +128,71 @@ node=node-a 返回业务错误 code=-32601 (method x not found)，确定性结�
 策略拒绝、畸形项）都不会拖垮或截断整批，调用方原始 `id`（数字/字符串/null/重复）
 原样回显，不错位、不互相污染。
 
-## 5. 假节点故障模型（`fakeupstream`）
+## 5. 等待交易确认（`waiter.py`，方法 `gw_waitForTransaction`）
+
+调用方提交交易标识、确认条件与总等待预算，网关在预算内向**上游**轮询
+`eth_getTransactionReceipt`，满足条件即返回落块位置与确认程度。
+
+### 5.1 请求与结果
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"gw_waitForTransaction","params":{
+  "txHash": "0x...",          // 必填，0x 前缀
+  "confirmations": 3,         // 可选，确认数阈值，默认 1
+  "finalized": true,          // 可选，为 true 时要求所在高度已最终确定
+  "timeoutMs": 10000          // 可选，总等待预算，默认 30000，上限 300000
+}}
+```
+
+也兼容位置参数形态 `[txHash, {options...}]`。参数非法返回 `-32602`。
+
+成功结果（`status` 为 `confirmed` 或 `finalized`）：
+
+```json
+{"txHash":"0x...","status":"confirmed","blockNumber":"0xb",
+ "blockHash":"0x...","confirmations":3,"finalized":false}
+```
+
+失败结果与成功严格区分，**绝不返回未达标的结果**：
+
+| 情形 | 错误码 |
+|---|---|
+| 预算耗尽仍未达标（从未上链 / 确认数不足） | `-32020 WAIT_TIMEOUT` |
+| 等待期间被重组回滚且预算内未重新上链 | `-32021 TX_REORGED`（`data.lastIncluded` 给出回滚前位置） |
+
+### 5.2 确认深度与最终性的判定
+
+- 确认数 = 当前链顶高度 − 交易所在高度 + 1，链顶/最终高度取自与最终性缓存
+  相同的本地链镜像；
+- `confirmations` 与 `finalized` 同时给出时需**同时满足**；
+- 预算从请求进入等待时开始计时，到期立即返回对应错误，不挂起、不延期。
+
+### 5.3 轮询合并（按交易 single-flight）
+
+同一 `tx_hash` 无论多少并发等待方（含同一批次内的多项），只存在**一个**
+`TxWatch` 轮询任务，按固定间隔（`Dispatcher(wait_poll_interval=...)`，
+默认 1s）产生一路上游调用；每个等待方持有自己的条件与预算，独立对共享
+观测做判定，各自拿到的结果严格对应自己的请求 `id` 与条件，互不影响。
+最后一个等待方结束后轮询任务即停止。
+
+### 5.4 重组处理
+
+轮询发现回执从“已上链”变为“不存在”即判定重组，观测转为 `dropped`：
+
+- 仍在等待的调用方**不会**拿到回滚前的确认结论；
+- 预算内交易重新上链（新高度/新哈希）→ 按**新位置**继续判定并返回；
+- 预算耗尽仍未重新上链 → `-32021 TX_REORGED`，与正常确认明确区分。
+
+### 5.5 与既有能力的兼容
+
+- 每一轮轮询都走 `Dispatcher.dispatch_single`：节点选择、传输故障切换
+  重试、业务错误短路、方法策略（如把 `gw_waitForTransaction` 或
+  `eth_getTransactionReceipt` 加入黑名单即 `-32001`）全部生效；
+- 等待方法可出现在批量请求中，与其他项并发独立分发、按 `id` 对齐；
+- 轮询方法 `eth_getTransactionReceipt` 不属于最终性缓存的可缓存集合，
+  不占用也不绕过缓存；既有只读缓存与 single-flight 行为不变。
+
+## 6. 假节点故障模型（`fakeupstream`）
 
 每个节点以守护线程运行**真实 uvicorn + TCP 端口**，支持确定性注入：
 

@@ -152,6 +152,31 @@ def create_app(
                 "finalized": chain.finalized_number(),
                 "invalidated": invalidated}
 
+    @app.post("/admin/include_tx")
+    async def admin_include_tx(request: Request):
+        """测试/运维辅助：把交易打包进指定高度（默认链顶）。"""
+        body = await request.json()
+        tx_hash = body.get("txHash")
+        if not isinstance(tx_hash, str):
+            return JSONResponse(
+                {"error": "txHash required"}, status_code=400)
+        height = body.get("height")
+        try:
+            number = chain.include_tx(
+                tx_hash, int(height) if height is not None else None)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        logger.info("打包交易 tx=%s height=%s", tx_hash, number)
+        return {"txHash": tx_hash, "height": number,
+                "blockHash": chain.block_hash_at(number)}
+
+    @app.post("/admin/drop_tx")
+    async def admin_drop_tx(request: Request):
+        """测试/运维辅助：把交易从所在区块摘除（模拟未被打包）。"""
+        body = await request.json()
+        dropped = chain.drop_tx(body.get("txHash", ""))
+        return {"dropped": dropped}
+
     @app.get("/health")
     async def health():
         return {"status": "ok", "head": chain.head_number(),
